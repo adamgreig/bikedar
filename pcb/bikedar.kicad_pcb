@@ -5,7 +5,7 @@
     (no_connects 0)
     (area 49.649999 49.749999 158.157143 101.5325)
     (thickness 1)
-    (drawings 126)
+    (drawings 127)
     (tracks 907)
     (zones 0)
     (modules 50)
@@ -17,7 +17,7 @@
     (0 F.Cu signal)
     (1 In1.Cu signal hide)
     (2 In2.Cu signal hide)
-    (31 B.Cu signal hide)
+    (31 B.Cu signal)
     (32 B.Adhes user)
     (33 F.Adhes user)
     (34 B.Paste user)
@@ -2234,6 +2234,9 @@
     )
   )
 
+  (gr_text "AG\nr1" (at 53 88.2) (layer F.Cu)
+    (effects (font (size 1.5 1.5) (thickness 0.3)))
+  )
   (gr_line (start 76 65) (end 76 65) (layer Dwgs.User) (width 0.1) (tstamp 591BC1B2))
   (gr_line (start 74 69) (end 74 65) (layer Dwgs.User) (width 0.1) (tstamp 591BC1B1))
   (gr_line (start 71 53) (end 71 57) (layer Dwgs.User) (width 0.1) (tstamp 591BC1B0))
@@ -4062,6 +4065,21 @@
     (filled_polygon
       (pts
         (xy 99.925 50.925) (xy 50.075 50.925) (xy 50.075 50.075) (xy 99.925 50.075)
+      )
+    )
+  )
+  (zone (net 0) (net_name "") (layer F.Mask) (tstamp 0) (hatch edge 0.508)
+    (connect_pads (clearance 0))
+    (min_thickness 0.254)
+    (fill yes (arc_segments 16) (thermal_gap 0.508) (thermal_bridge_width 0.508))
+    (polygon
+      (pts
+        (xy 50.5 85.5) (xy 55 85.5) (xy 55 91) (xy 50.5 91)
+      )
+    )
+    (filled_polygon
+      (pts
+        (xy 54.873 90.873) (xy 50.627 90.873) (xy 50.627 85.627) (xy 54.873 85.627)
       )
     )
   )
