@@ -11,12 +11,6 @@ from scipy.special import jn
 from sexp import generate
 
 
-pcb_h = 0.2
-patch_length = 2.82e-3
-array_x = 4
-array_y = 2
-
-
 def patch_impedance(w, l, r, h, f0):
     """
     Compute an estimate of the patch impedance, for patch of width w and length
@@ -277,8 +271,8 @@ def generate_pcb(feedpoints, cuts, zones, drawings):
             ["tstamp", 0],
             ["at", feedpoint[0], feedpoint[1]],
             ["pad",
-                1, "thru_hole", "circle", ["at", 0, 0], ["size", 2.5, 2.5],
-                ["drill", 1.5], ["layers", "F.Cu"], ["zone_connect", 2],
+                1, "thru_hole", "circle", ["at", 0, 0], ["size", 0.8, 0.8],
+                ["drill", 0.5], ["layers", "F.Cu"], ["zone_connect", 2],
                 ["net", 1, "Antennas"]]],
 
     # Draw cutouts
@@ -334,11 +328,3 @@ def generate_pcb(feedpoints, cuts, zones, drawings):
             ["via_drill", 0.4]],
     ] + modules + edges + kicad_drawings + kicad_zones
     return generate(out)
-
-
-if __name__ == "__main__":
-    feedpoints, cutouts, zones = make_arrays(antennas)
-    pcb = generate_pcb(feedpoints, cutouts, zones, [])
-
-    with open("antennas.kicad_pcb", "w") as f:
-        f.write(pcb)
