@@ -1,0 +1,71 @@
+Bill Of Materials
+=================
+
+Source file: bikedar.xml
+Date: 2017-05-18T23:11:27.232019
+
+Parts Missing Footprints
+------------------------
+AE2    ANT            
+AE3    ANT            
+AE1    ANT            
+
+Parts Missing Order Codes
+-------------------------
+X1     M3_MOUNT        agg:M3_MOUNT
+X2     M3_MOUNT        agg:M3_MOUNT
+TP2    TESTPAD         agg:SIL-254P-01
+TP1    TESTPAD         agg:TESTPAD
+X4     M3_MOUNT        agg:M3_MOUNT
+X3     M3_MOUNT        agg:M3_MOUNT
+AE2    ANT             None
+AE3    ANT             None
+AE1    ANT             None
+
+Inconsistent Order Codes
+------------------------
+
+
+Vendor Specific BOMs
+--------------------
+  Mouser
+  ~~~~~~
+726-4MTR12E6327XUMA1 1
+81-GRM188Z71A106MA3J 4
+279-CPF0402B5K49E1 4
+710-885012206008 1
+710-885012205025 1
+584-AD8541AKSZ-R7 2
+81-GRM188R71C105KE5J 4
+71-CRCW0603-1.0K-E3 1
+710-885012205018 2
+710-150060VS75000 1
+660-RN731ETTP50R0F50 1
+584-AD8226BRMZ 4
+710-885012206020 8
+ADP3335ARMZ-3.3RL7 1
+603-RC0402FR-07100RL 3
+710-61302021121 1
+603-RC0603FR-0710KL 5
+
+
+Assembly BOM
+------------
+726-4MTR12E6327XUMA1 1   BGT24MTR12      QFN-32-BGT24MTR IC2
+81-GRM188Z71A106MA3J 4   10µ             0603            C15 C19 C20 C4
+279-CPF0402B5K49E1   4   5k49            0402            R6 R7 R8 R9
+710-885012206008     1   1n              0603            C2
+710-885012205025     1   1n              0402            C9
+584-AD8541AKSZ-R7    2   AD8541          SC-70-5         IC3 IC8
+81-GRM188R71C105KE5J 4   1µ              0603            C1 C18 C3 C7
+71-CRCW0603-1.0K-E3  1   1k              0603            R14
+710-885012205018     2   100n            0402            C5 C6
+710-150060VS75000    1   LED             0603-LED        D1
+660-RN731ETTP50R0F50 1   50              0402            R3
+584-AD8226BRMZ       4   AD8226          MSOP-8          IC4 IC5 IC6 IC7
+710-885012206020     8   100n            0603            C10 C11 C12 C13 C14 C16 C17 C8
+ADP3335ARMZ-3.3RL7   1   ADP3335         MSOP-8          IC1
+603-RC0402FR-07100RL 3   100             0402            R1 R13 R2
+710-61302021121      1   CONN_02x10      DIL-254P-20     J1
+603-RC0603FR-0710KL  5   10k             0603            R10 R11 R12 R4 R5
+
