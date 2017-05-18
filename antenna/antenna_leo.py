@@ -26,22 +26,13 @@ w70 = 0.278e-3
 λ70 = 7.711e-3
 
 # Other free geometry
-colsep = λ50/2
+colsep = 0
 patchsep = 1.500e-3
-
-# Optional feed line geometry for edge-fed array
-feed_tail_len = 35e-3 / 2.0
 
 # Start from a feed point at (0, 0)
 
 # Mirror for positive and negative y
-for ydir in (+1, -1):
-
-    # Transformer from 100 (half feedpoint) to 50 (feed to top branch)
-    add(feedline([(0, 0), (0, ydir * λ70/4)], w70, h))
-
-    # 50R feedline from that transformer to the top branch
-    add(feedline([(0, ydir * λ70/4), (0, ydir * colsep)], w50, h))
+for ydir in (+1,):
 
     # Mirror for positive and negative x
     for xdir in (+1, -1):
@@ -73,20 +64,8 @@ for ydir in (+1, -1):
         add(translate(patch, xdir*λ70/4 + xdir*λ35/4 + xdir*λ50,
                       ydir * colsep + patchsep + Lp/2))
 
-# Optional feed line for edge-fed array
-edge_feed = feedline([
-    (0, 0),
-    ((λ70/4+λ35/4-Wp/2)/2, 0),
-    ((λ70/4+λ35/4-Wp/2)/2, (patchsep+Lp)/2),
-    (feed_tail_len, (patchsep+Lp)/2)], w50, h)
-
 pcb_centrefed = generate_pcb([(0, 0)], [], zones, [])
-pcb_edgefed = generate_pcb(
-    [(feed_tail_len, (patchsep+Lp)/2)], [],
-    zones+[edge_feed], [])
 
 if __name__ == "__main__":
-    with open("antenna_centrefed.kicad_pcb", "w") as f:
+    with open("antenna_leo.kicad_pcb", "w") as f:
         f.write(pcb_centrefed)
-    with open("antenna_edgefed.kicad_pcb", "w") as f:
-        f.write(pcb_edgefed)
