@@ -1,0 +1,17 @@
+[package]
+authors = ["Jorge Aparicio <jorge@japaric.io>"]
+categories = ["embedded", "no-std"]
+description = "A template for building applications for ARM Cortex-M microcontrollers"
+keywords = ["arm", "cortex-m", "template"]
+license = "MIT OR Apache-2.0"
+name = "cortex-m-quickstart"
+repository = "https://github.com/japaric/cortex-m-quickstart"
+version = "0.1.7"
+
+[dependencies]
+cortex-m = "0.2.7"
+cortex-m-rt = "0.2.2"
+
+[profile.release]
+lto = true
+debug = true
