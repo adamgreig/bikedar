@@ -6,123 +6,17 @@
 extern crate cortex_m;
 extern crate cortex_m_rt;
 extern crate stm32f7;
+extern crate smoltcp;
 
 use core::u16;
 use cortex_m::asm;
-use stm32f7::stm32f7x7::{GPIOA, GPIOB, GPIOC, GPIOD, GPIOG, USART3};
+use stm32f7::stm32f7x7::{GPIOA, GPIOB, GPIOC, GPIOD, GPIOG, USART3, TIM5};
 use stm32f7::stm32f7x7::{RCC, PWR, SYSCFG, FLASH, ETHERNET_MAC, ETHERNET_DMA};
-
-#[repr(C,packed)]
-struct MACHeader {
-    dst: [u8; 6],
-    src: [u8; 6],
-    ethertype: u16,
-}
-
-#[repr(C,packed)]
-struct ARPPacket {
-    mac: MACHeader,
-    htype: u16,
-    ptype: u16,
-    hlen: u8,
-    plen: u8,
-    oper: u16,
-    sha: [u8; 6],
-    spa: [u8; 4],
-    tha: [u8; 6],
-    tpa: [u8; 4],
-}
-
-#[repr(C,packed)]
-struct IP4Header {
-    vers_ihl: u8,
-    dscp_ecn: u8,
-    len: u16,
-    id: u16,
-    flags_frag: u16,
-    ttl: u8,
-    proto: u8,
-    crc: u16,
-    src: [u8; 4],
-    dst: [u8; 4],
-}
-
-#[repr(C,packed)]
-struct ICMPHeader {
-    type_: u8,
-    code: u8,
-    checksum: u16,
-    data: u32,
-}
-
-#[repr(C,packed)]
-struct ICMPPing {
-    mac: MACHeader,
-    ip4: IP4Header,
-    icmp: ICMPHeader,
-    payload: [u8; 128],
-}
-
-static ARP_ANNOUNCE: ARPPacket = ARPPacket {
-    mac: MACHeader {
-        dst: [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
-        src: [0x56, 0x54, 0x9f, 0x08, 0x87, 0x1d],
-        ethertype: 0x0608,
-    },
-    htype: 0x0100,
-    ptype: 0x0008,
-    hlen: 6,
-    plen: 4,
-    oper: 0x0100,
-    sha: [0x56, 0x54, 0x9f, 0x08, 0x87, 0x1d],
-    spa: [192, 168, 2, 202],
-    tha: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-    tpa: [192, 168, 2, 202],
-};
-
-static mut ARP_REPLY: ARPPacket = ARPPacket {
-    mac: MACHeader {
-        dst: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        src: [0x56, 0x54, 0x9f, 0x08, 0x87, 0x1d],
-        ethertype: 0x0608,
-    },
-    htype: 0x0100,
-    ptype: 0x0008,
-    hlen: 6,
-    plen: 4,
-    oper: 0x0200,
-    sha: [0x56, 0x54, 0x9f, 0x08, 0x87, 0x1d],
-    spa: [192, 168, 2, 202],
-    tha: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-    tpa: [0, 0, 0, 0],
-};
-
-static mut ICMP_PING_RESPONSE: ICMPPing = ICMPPing {
-    mac: MACHeader {
-        dst: [0x60, 0xa4, 0x4c, 0x5f, 0x45, 0x6f],
-        src: [0x56, 0x54, 0x9f, 0x08, 0x87, 0x1d],
-        ethertype: 0x0008,
-    },
-    ip4: IP4Header {
-        vers_ihl: (4<<4) | 5,
-        dscp_ecn: 0,
-        len: 0,
-        id: 0,
-        flags_frag: 1<<6,
-        ttl: 255,
-        proto: 1,
-        crc: 0,
-        src: [192, 168, 2, 202],
-        dst: [192, 168, 2, 2],
-    },
-    icmp: ICMPHeader {
-        type_: 0,
-        code: 0,
-        checksum: 0,
-        data: 0,
-    },
-    payload: [0; 128],
-};
+use smoltcp::phy::Device;
+use smoltcp::iface::{ArpCache, SliceArpCache, EthernetInterface};
+use smoltcp::socket::{AsSocket, SocketSet};
+use smoltcp::socket::{TcpSocket, TcpSocketBuffer};
+use smoltcp::wire::{EthernetAddress, IpAddress};
 
 static mut TBUF: [[u32; 512]; 2] = [[0; 512]; 2];
 static mut RBUF: [[u32; 512]; 2] = [[0; 512]; 2];
@@ -152,6 +46,123 @@ struct RDes {
 static mut RD0: RDes = RDes { rdes0: 0, rdes1: 0, rdes2: 0, rdes3: 0 };
 static mut RD1: RDes = RDes { rdes0: 0, rdes1: 0, rdes2: 0, rdes3: 0 };
 static mut RDPTR: &RDes = unsafe { &RD0 };
+
+fn rxne() -> bool {
+    unsafe {
+        RDPTR = &*(RDPTR.rdes3 as *const RDes);
+        asm::dmb();
+        RDPTR.rdes0 & (1<<31) == 0
+    }
+}
+
+fn txe() -> bool {
+    unsafe {
+        TDPTR = &*(TDPTR.tdes3 as *const TDes);
+        asm::dmb();
+        TDPTR.tdes0 & (1<<31) == 0
+    }
+}
+
+fn transmit_packet(packet: &[u8]) {
+    unsafe {
+        let len = packet.len();
+
+        if packet as *const _ as *const u8 == &(TBUF[0]) as *const _ as *const u8 {
+            TD0.tdes1 = len as u32;
+            TD0.tdes0 = (1<<31) | (1<<30) | (1<<29) | (1<<28) | (3<<22) | (1<<20);
+        } else {
+            TD1.tdes1 = len as u32;
+            TD1.tdes0 = (1<<31) | (1<<30) | (1<<29) | (1<<28) | (3<<22) | (1<<20);
+        }
+        asm::dmb();
+
+        /* If DMA has stopped, tell it to restart */
+        cortex_m::interrupt::free(|cs| {
+            let eth_dma = ETHERNET_DMA.borrow(cs);
+            if eth_dma.dmasr.read().tps().bits() == 0b110 {
+                eth_dma.dmasr.write(|w| w.tbus().set_bit());
+                eth_dma.dmatpdr.write(|w| w.tpd().bits(0xFFFF_FFFF));
+            }
+        });
+    }
+}
+
+fn get_tx_buffer(length: usize) -> &'static mut [u8] {
+    unsafe {
+        core::slice::from_raw_parts_mut(TDPTR.tdes2 as *mut u8, length)
+    }
+}
+
+fn receive_packet() -> &'static [u8] {
+    unsafe {
+        let len = (RDPTR.rdes0 >> 16) & 0x3FFF;
+        core::slice::from_raw_parts(RDPTR.rdes2 as *const u8, len as usize)
+    }
+}
+
+fn release_packet(buf: &[u8]) {
+    unsafe {
+        if buf as *const _ as *const u8 == &(RBUF[0]) as *const _ as *const u8 {
+            RD0.rdes0 = 1<<31;
+        } else {
+            RD1.rdes0 = 1<<31;
+        }
+        asm::dmb();
+
+        // Check if DMA has stopped and restart if so
+        cortex_m::interrupt::free(|cs| {
+            let eth_dma = ETHERNET_DMA.borrow(cs);
+            if eth_dma.dmasr.read().rps().bits() == 0b110 {
+                eth_dma.dmasr.write(|w| w.rbus().set_bit());
+                eth_dma.dmarpdr.write(|w| w.rpd().bits(0xFFFF_FFFF));
+            }
+        });
+    }
+}
+
+struct EthernetRxBuffer(&'static [u8]);
+struct EthernetTxBuffer(&'static mut [u8]);
+
+impl AsRef<[u8]> for EthernetTxBuffer { fn as_ref(&self) -> &[u8] { self.0 } }
+impl AsRef<[u8]> for EthernetRxBuffer { fn as_ref(&self) -> &[u8] { self.0 } }
+impl AsMut<[u8]> for EthernetTxBuffer { fn as_mut(&mut self) -> &mut [u8] { self.0 } }
+
+impl Drop for EthernetTxBuffer {
+    fn drop(&mut self) {
+        transmit_packet(self.0);
+    }
+}
+
+impl Drop for EthernetRxBuffer {
+    fn drop(&mut self) {
+        release_packet(self.0);
+    }
+}
+
+struct EthernetDevice {}
+
+impl Device for EthernetDevice {
+    type RxBuffer = EthernetRxBuffer;
+    type TxBuffer = EthernetTxBuffer;
+
+    fn mtu(&self) -> usize { 1536 }
+
+    fn receive(&mut self) -> Result<Self::RxBuffer, smoltcp::Error> {
+        if rxne() {
+            Ok(EthernetRxBuffer(receive_packet()))
+        } else {
+            Err(smoltcp::Error::Exhausted)
+        }
+    }
+
+    fn transmit(&mut self, length: usize) -> Result<Self::TxBuffer, smoltcp::Error> {
+        if txe() {
+            Ok(EthernetTxBuffer(get_tx_buffer(length)))
+        } else {
+            Err(smoltcp::Error::Exhausted)
+        }
+    }
+}
 
 fn gpio_init() {
     cortex_m::interrupt::free(|cs| {
@@ -285,6 +296,7 @@ fn rcc_reset() {
         );
         rcc.apb1rstr.write(|w|
             w.uart3rst().reset()
+             .tim3rst().reset()
         );
         rcc.ahb1rstr.write(|w| unsafe { w.bits(0)});
         rcc.apb1rstr.write(|w| unsafe { w.bits(0)});
@@ -312,6 +324,7 @@ fn rcc_start() {
         );
         rcc.apb1enr.modify(|_, w|
             w.usart3en().enabled()
+             .tim5en().enabled()
         );
     });
 }
@@ -343,6 +356,25 @@ fn usart_send_string(data: &str) {
     for c in data.as_bytes() {
         usart_send(*c as u32);
     }
+}
+
+fn timer_init() {
+    cortex_m::interrupt::free(|cs| {
+        let tim5 = TIM5.borrow(cs);
+        tim5.psc.write(|w| unsafe { w.psc().bits(42000 - 1) });
+        tim5.arr.write(|w| unsafe {
+            w.arr_l().bits(0xffff).arr_h().bits(0xffff) });
+        tim5.cr1.modify(|_, w| w.cen().set_bit());
+    });
+}
+
+fn timer_time() -> u32 {
+    cortex_m::interrupt::free(|cs| {
+        let tim5 = TIM5.borrow(cs);
+        let low = tim5.cnt.read().cnt_l().bits() as u32;
+        let high = tim5.cnt.read().cnt_h().bits() as u32;
+        high<<16 | low
+    })
 }
 
 fn mac_init() {
@@ -500,93 +532,6 @@ fn phy_poll_link() -> bool {
     true
 }
 
-fn send_packet(packet: &[u8]) {
-    unsafe {
-        while TDPTR.tdes0 & (1<<31) == (1<<31) {
-            TDPTR = &*(TDPTR.tdes3 as *const TDes);
-            asm::dmb();
-        }
-
-        /* Copy packet into descriptor */
-        let len = packet.len();
-        let mut tdbuf: &mut [u8] = core::slice::from_raw_parts_mut(TDPTR.tdes2 as *mut u8, len);
-        tdbuf.copy_from_slice(packet);
-
-        // urgghhh
-        if TDPTR as *const TDes == &TD0 as *const TDes {
-            TD0.tdes1 = len as u32;
-            TD0.tdes0 = (1<<31) | (1<<30) | (1<<29) | (1<<28) | (3<<22) | (1<<20);
-        } else {
-            TD1.tdes1 = len as u32;
-            TD1.tdes0 = (1<<31) | (1<<30) | (1<<29) | (1<<28) | (3<<22) | (1<<20);
-        }
-        asm::dmb();
-
-        /* If DMA has stopped, tell it to restart */
-        cortex_m::interrupt::free(|cs| {
-            let eth_dma = ETHERNET_DMA.borrow(cs);
-            if eth_dma.dmasr.read().tps().bits() == 0b110 {
-                eth_dma.dmasr.write(|w| w.tbus().set_bit());
-                eth_dma.dmatpdr.write(|w| w.tpd().bits(0xFFFF_FFFF));
-            }
-        });
-    }
-}
-
-fn read_packet() {
-    unsafe {
-        while RDPTR.rdes0 & (1<<31) == (1<<31) {
-            RDPTR = &*(RDPTR.rdes3 as *const RDes);
-            asm::dmb();
-        }
-    }
-}
-
-fn release_packet() {
-    unsafe {
-        if RDPTR as *const RDes == &RD0 as *const RDes {
-            RD0.rdes0 = 1<<31;
-        } else {
-            RD1.rdes0 = 1<<31;
-        }
-        asm::dmb();
-
-        // Check if DMA has stopped and restart if so
-        cortex_m::interrupt::free(|cs| {
-            let eth_dma = ETHERNET_DMA.borrow(cs);
-            if eth_dma.dmasr.read().rps().bits() == 0b110 {
-                eth_dma.dmasr.write(|w| w.rbus().set_bit());
-                eth_dma.dmarpdr.write(|w| w.rpd().bits(0xFFFF_FFFF));
-            }
-        });
-    }
-}
-
-fn send_ping_reply() {
-    unsafe {
-        let ping: &mut ICMPPing = &mut *(RDPTR.rdes2 as *mut RDes as *mut ICMPPing);
-        ICMP_PING_RESPONSE.icmp.data = ping.icmp.data;
-        ICMP_PING_RESPONSE.ip4.len = ping.ip4.len;
-        let len = (((ping.ip4.len & 0xFF00) >> 8) | ((ping.ip4.len & 0x00FF) << 8)) as usize;
-        &ICMP_PING_RESPONSE.payload[..len-28].copy_from_slice(&ping.payload[..len-28]);
-        release_packet();
-        let packet_slice: &[u8] = core::slice::from_raw_parts(&ICMP_PING_RESPONSE as *const _ as *const u8, len+14);
-        send_packet(packet_slice);
-    }
-}
-
-fn send_arp_reply() {
-    unsafe {
-        let arp: &mut ARPPacket = &mut *(RDPTR.rdes2 as *mut RDes as *mut ARPPacket);
-        ARP_REPLY.mac.dst = arp.mac.src;
-        ARP_REPLY.tha = arp.sha;
-        ARP_REPLY.tpa = arp.spa;
-        release_packet();
-        let packet_slice: &[u8] = core::slice::from_raw_parts(&ARP_REPLY as *const _ as *const u8, 42);
-        send_packet(packet_slice);
-    }
-}
-
 #[inline(never)]
 fn main() {
     cortex_m::interrupt::free(|cs| {
@@ -601,42 +546,56 @@ fn main() {
     rcc_start();
     rcc_reset();
     gpio_init();
+    timer_init();
 
     usart_init();
-    usart_send_string("\r\n\r\nInitialising...\r\n");
+    usart_send_string("\r\n\r\nInitialising network...\r\n");
 
     phy_reset();
     phy_init();
     mac_init();
 
+    let mut arpcache_storage = [Default::default(); 8];
+    let mut arpcache = SliceArpCache::new(&mut arpcache_storage[..]);
+    let mut ethdev = EthernetDevice {};
+    let ethaddr = EthernetAddress::from_bytes(&[0x56, 0x54, 0x9f, 0x08, 0x87, 0x1d]);
+    let mut ipaddrs = [IpAddress::v4(192, 168, 2, 202)];
+    let mut ethiface = EthernetInterface::new(
+        &mut ethdev, &mut arpcache as &mut ArpCache, ethaddr, &mut ipaddrs[..]);
+
+    let mut tcp_rx_buf_storage = [Default::default(); 128];
+    let mut tcp_tx_buf_storage = [Default::default(); 128];
+    let tcp_rx_buf = TcpSocketBuffer::new(&mut tcp_rx_buf_storage[..]);
+    let tcp_tx_buf = TcpSocketBuffer::new(&mut tcp_tx_buf_storage[..]);
+    let tcp_socket = TcpSocket::new(tcp_rx_buf, tcp_tx_buf);
+
+    let mut sockets_storage = [Default::default(), Default::default()];
+    let mut sockets = SocketSet::new(&mut sockets_storage[..]);
+    let tcp_handle = sockets.add(tcp_socket);
+
     usart_send_string("Waiting for link...\r\n");
     while !phy_poll_link() { }
     usart_send_string("Link established.\r\n");
 
-    unsafe {
-        let arp_announce_slice: &[u8] = core::slice::from_raw_parts(&ARP_ANNOUNCE as *const _ as *const u8, 42);
-        usart_send_string("Sending ARP announce...");
-        send_packet(arp_announce_slice);
-        usart_send_string("sent.\r\n");
-
-        loop {
-            usart_send_string("Waiting for packet to arrive...");
-            read_packet();
-            usart_send_string("received.\r\n");
-
-            let mac: &MACHeader = &*(RDPTR.rdes2 as *mut RDes as *mut MACHeader);
-            if mac.ethertype == 0x0608 {
-                send_arp_reply();
-            } else if mac.ethertype == 0x0008 {
-                let ping: &ICMPPing = &*(RDPTR.rdes2 as *mut RDes as *mut ICMPPing);
-                if ping.ip4.proto == 1 {
-                    send_ping_reply();
-                } else {
-                    release_packet();
-                }
-            } else {
-                release_packet();
+    loop {
+        {
+            let socket: &mut TcpSocket = sockets.get_mut(tcp_handle).as_socket();
+            if !socket.is_open() {
+                socket.listen(6969).unwrap();
             }
+            if socket.can_send() {
+                let data = b"hello world\n";
+                usart_send_string("Sending TCP data\r\n");
+                socket.send_slice(data).unwrap();
+                usart_send_string("Closing socket\r\n");
+                socket.close();
+            }
+        }
+
+        let time_ms = timer_time() as u64;
+        match ethiface.poll(&mut sockets, time_ms) {
+            Ok(()) | Err(smoltcp::Error::Exhausted) => (),
+            Err(_) => usart_send_string("Network error\r\n"),
         }
     }
 }

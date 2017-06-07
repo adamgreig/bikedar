@@ -26,3 +26,7 @@ features = [ "panic-over-semihosting" ]
 [dependencies.stm32f7]
 path = "/home/adam/Projects/stm32-rs/stm32f7"
 features = ["stm32f7x7"]
+[dependencies.smoltcp]
+version = "0.3"
+default-features = false
+features = []
