@@ -18,9 +18,6 @@ use smoltcp::socket::{AsSocket, SocketSet};
 use smoltcp::socket::{TcpSocket, TcpSocketBuffer};
 use smoltcp::wire::{EthernetAddress, IpAddress};
 
-static mut TBUF: [[u32; 512]; 2] = [[0; 512]; 2];
-static mut RBUF: [[u32; 512]; 2] = [[0; 512]; 2];
-
 #[repr(C,packed)]
 #[derive(Copy,Clone)]
 struct TDes {
@@ -29,10 +26,6 @@ struct TDes {
     tdes2: u32,
     tdes3: u32,
 }
-
-static mut TD0: TDes = TDes { tdes0: 0, tdes1: 0, tdes2: 0, tdes3: 0 };
-static mut TD1: TDes = TDes { tdes0: 0, tdes1: 0, tdes2: 0, tdes3: 0 };
-static mut TDPTR: &TDes = unsafe { &TD0 };
 
 #[repr(C,packed)]
 #[derive(Copy,Clone)]
@@ -43,78 +36,55 @@ struct RDes {
     rdes3: u32,
 }
 
-static mut RD0: RDes = RDes { rdes0: 0, rdes1: 0, rdes2: 0, rdes3: 0 };
-static mut RD1: RDes = RDes { rdes0: 0, rdes1: 0, rdes2: 0, rdes3: 0 };
-static mut RDPTR: &RDes = unsafe { &RD0 };
+// Assign buffers as u32 to ensure alignment, but we'll use them as u8
+const ETH_BUF_LEN: usize = 8;
+static mut TBUF: [[u32; 2048/4]; ETH_BUF_LEN] = [[0; 2048/4]; ETH_BUF_LEN];
+static mut RBUF: [[u32; 2048/4]; ETH_BUF_LEN] = [[0; 2048/4]; ETH_BUF_LEN];
+static mut TD: [TDes; ETH_BUF_LEN] = [TDes {tdes0: 0, tdes1: 0, tdes2: 0, tdes3: 0}; ETH_BUF_LEN];
+static mut RD: [RDes; ETH_BUF_LEN] = [RDes {rdes0: 0, rdes1: 0, rdes2: 0, rdes3: 0}; ETH_BUF_LEN];
+static mut TDPTR: usize = 0;
+static mut RDPTR: usize = 0;
 
-fn rxne() -> bool {
+fn transmit_packet(buf: &[u8]) {
     unsafe {
-        RDPTR = &*(RDPTR.rdes3 as *const RDes);
-        asm::dmb();
-        RDPTR.rdes0 & (1<<31) == 0
-    }
-}
-
-fn txe() -> bool {
-    unsafe {
-        TDPTR = &*(TDPTR.tdes3 as *const TDes);
-        asm::dmb();
-        TDPTR.tdes0 & (1<<31) == 0
-    }
-}
-
-fn transmit_packet(packet: &[u8]) {
-    unsafe {
-        let len = packet.len();
-
-        if packet as *const _ as *const u8 == &(TBUF[0]) as *const _ as *const u8 {
-            TD0.tdes1 = len as u32;
-            TD0.tdes0 = (1<<31) | (1<<30) | (1<<29) | (1<<28) | (3<<22) | (1<<20);
-        } else {
-            TD1.tdes1 = len as u32;
-            TD1.tdes0 = (1<<31) | (1<<30) | (1<<29) | (1<<28) | (3<<22) | (1<<20);
+        for td in TD.iter_mut() {
+            if buf.as_ptr() as u32 == td.tdes2 as u32 {
+                usart_send_string("TX\r\n");
+                td.tdes1 = buf.len() as u32;
+                td.tdes0 |= 1<<31;
+                break;
+            }
         }
-        asm::dmb();
 
-        /* If DMA has stopped, tell it to restart */
+        // Check if the TX DMA has suspended due to no new packets
         cortex_m::interrupt::free(|cs| {
             let eth_dma = ETHERNET_DMA.borrow(cs);
             if eth_dma.dmasr.read().tps().bits() == 0b110 {
-                eth_dma.dmasr.write(|w| w.tbus().set_bit());
-                eth_dma.dmatpdr.write(|w| w.tpd().bits(0xFFFF_FFFF));
+                // Wait for our update to TDES0 then request a restart
+                asm::dsb();
+                eth_dma.dmatpdr.write(|w| w.tpd().bits(0));
             }
         });
     }
 }
 
-fn get_tx_buffer(length: usize) -> &'static mut [u8] {
-    unsafe {
-        core::slice::from_raw_parts_mut(TDPTR.tdes2 as *mut u8, length)
-    }
-}
-
-fn receive_packet() -> &'static [u8] {
-    unsafe {
-        let len = (RDPTR.rdes0 >> 16) & 0x3FFF;
-        core::slice::from_raw_parts(RDPTR.rdes2 as *const u8, len as usize)
-    }
-}
-
 fn release_packet(buf: &[u8]) {
+    // Find the RDes that held this buffer and release it to the DMA
     unsafe {
-        if buf as *const _ as *const u8 == &(RBUF[0]) as *const _ as *const u8 {
-            RD0.rdes0 = 1<<31;
-        } else {
-            RD1.rdes0 = 1<<31;
+        for rd in RD.iter_mut() {
+            if buf.as_ptr() as u32 == rd.rdes2 {
+                rd.rdes0 |= 1<<31;
+                break;
+            }
         }
-        asm::dmb();
 
-        // Check if DMA has stopped and restart if so
+        // Check if the RX DMA has suspended due to all buffers taken
         cortex_m::interrupt::free(|cs| {
             let eth_dma = ETHERNET_DMA.borrow(cs);
-            if eth_dma.dmasr.read().rps().bits() == 0b110 {
-                eth_dma.dmasr.write(|w| w.rbus().set_bit());
-                eth_dma.dmarpdr.write(|w| w.rpd().bits(0xFFFF_FFFF));
+            if eth_dma.dmasr.read().rps().bits() == 0b100 {
+                // Wait for our update to RDES0 then request a restart
+                asm::dsb();
+                eth_dma.dmarpdr.write(|w| w.rpd().bits(0));
             }
         });
     }
@@ -148,17 +118,35 @@ impl Device for EthernetDevice {
     fn mtu(&self) -> usize { 1536 }
 
     fn receive(&mut self) -> Result<Self::RxBuffer, smoltcp::Error> {
-        if rxne() {
-            Ok(EthernetRxBuffer(receive_packet()))
-        } else {
+        asm::dmb();
+
+        // See if the next RDes has been released by the DMA
+        unsafe {
+            if RD[RDPTR].rdes0 & (1<<31) == 0 {
+                usart_send_string("RX\r\n");
+                let len = (RD[RDPTR].rdes0 >> 16) & 0x3FFF;
+                let buf = core::slice::from_raw_parts(
+                    RD[RDPTR].rdes2 as *const u8, len as usize);
+                RDPTR = (RDPTR + 1) % ETH_BUF_LEN;
+                return Ok(EthernetRxBuffer(buf));
+            }
+
             Err(smoltcp::Error::Exhausted)
         }
     }
 
     fn transmit(&mut self, length: usize) -> Result<Self::TxBuffer, smoltcp::Error> {
-        if txe() {
-            Ok(EthernetTxBuffer(get_tx_buffer(length)))
-        } else {
+        asm::dmb();
+
+        // Look for an TDes that have been released by the DMA
+        unsafe {
+            if TD[TDPTR].tdes0 & (1<<31) == 0 {
+                let buf = core::slice::from_raw_parts_mut(
+                    TD[TDPTR].tdes2 as *mut u8, length);
+                TDPTR = (TDPTR + 1) % ETH_BUF_LEN;
+                return Ok(EthernetTxBuffer(buf));
+            }
+
             Err(smoltcp::Error::Exhausted)
         }
     }
@@ -283,7 +271,7 @@ fn rcc_init() {
 }
 
 fn rcc_reset() {
-    // Reset GPIOs and ethernet, and set ethernet to RMII
+    // Reset peripherals in use
     cortex_m::interrupt::free(|cs| {
         let rcc = RCC.borrow(cs);
         rcc.ahb1rstr.write(|w|
@@ -296,7 +284,7 @@ fn rcc_reset() {
         );
         rcc.apb1rstr.write(|w|
             w.uart3rst().reset()
-             .tim3rst().reset()
+             .tim5rst().reset()
         );
         rcc.ahb1rstr.write(|w| unsafe { w.bits(0)});
         rcc.apb1rstr.write(|w| unsafe { w.bits(0)});
@@ -339,7 +327,7 @@ fn usart_init() {
         usart3.cr3.modify(|_, w|
             w.dmat().set_bit()
         );
-        usart3.brr.write(|w| unsafe { w.bits(4375) });
+        usart3.brr.write(|w| unsafe { w.bits(84) });
         usart3.cr1.modify(|_, w| w.ue().set_bit());
     });
 }
@@ -361,20 +349,22 @@ fn usart_send_string(data: &str) {
 fn timer_init() {
     cortex_m::interrupt::free(|cs| {
         let tim5 = TIM5.borrow(cs);
+        tim5.cr1.modify(|_, w| w.cen().clear_bit());
         tim5.psc.write(|w| unsafe { w.psc().bits(42000 - 1) });
-        tim5.arr.write(|w| unsafe {
-            w.arr_l().bits(0xffff).arr_h().bits(0xffff) });
+        tim5.cnt.write(|w| unsafe { w.bits(0) });
+        tim5.arr.write(|w| unsafe { w.bits(0xffff_ffff) });
+        tim5.egr.write(|w| w.ug().set_bit());
         tim5.cr1.modify(|_, w| w.cen().set_bit());
     });
 }
 
 fn timer_time() -> u32 {
+    let mut time: u32 = 0;
     cortex_m::interrupt::free(|cs| {
         let tim5 = TIM5.borrow(cs);
-        let low = tim5.cnt.read().cnt_l().bits() as u32;
-        let high = tim5.cnt.read().cnt_h().bits() as u32;
-        high<<16 | low
-    })
+        time = tim5.cnt.read().bits();
+    });
+    time
 }
 
 fn mac_init() {
@@ -391,52 +381,41 @@ fn mac_init() {
         while eth_dma.dmabmr.read().sr().is_bit_set() {}
 
         // Set MAC address 56:54:9f:08:87:1d
-        eth_mac.maca0lr.write(|w| unsafe { w.bits(0x089f5456) });
-        eth_mac.maca0hr.write(|w| unsafe { w.bits(0x1d87) });
-
-        // Receive all
-        eth_mac.macffr.modify(|_, w| w.ra().set_bit().pm().set_bit());
+        eth_mac.maca0lr.write(|w| unsafe { w.bits(0x08_9f_54_56) });
+        eth_mac.maca0hr.write(|w| unsafe { w.bits(0x1d_87) });
 
         // Enable RX and TX now. Set link speed and duplex at link-up event.
         eth_mac.maccr.write(|w|
             w.re().set_bit()
-             .te().set_bit());
+             .te().set_bit()
+             .cstf().set_bit()
+        );
 
-        // Set up DMA descriptors in chain mode
+        // Unsafe access to static TD/RD and TBUF/RBUF
         unsafe {
-            TD0.tdes0 = 1<<20;
-            TD0.tdes1 = 2048;
-            TD0.tdes2 = (&TBUF[0] as *const u32) as u32;
-            TD0.tdes3 = (&TD1   as *const TDes) as u32;
+            // Set up all TDes in ring mode with associated buffer
+            for (td, tdbuf) in TD.iter_mut().zip(TBUF.iter()) {
+                td.tdes0 = (1<<29) | (1<<28);
+                td.tdes2 = tdbuf as *const _ as u32;
+                td.tdes3 = 0;
+            }
 
-            TD1.tdes0 = 1<<20;
-            TD1.tdes1 = 2048;
-            TD1.tdes2 = (&TBUF[1] as *const u32) as u32;
-            TD1.tdes3 = (&TD0   as *const TDes) as u32;
+            // Set up all RDes in ring mode with associated buffer
+            for (rd, rdbuf) in RD.iter_mut().zip(RBUF.iter()) {
+                rd.rdes0 = 1<<31;
+                rd.rdes1 = rdbuf.len() as u32 * 4;
+                rd.rdes2 = rdbuf as *const _ as u32;
+                rd.rdes3 = 0;
+            }
 
-            TDPTR = &TD0;
+            // Mark the final TDes and RDes as end-of-ring
+            TD.last_mut().unwrap().tdes0 |= 1<<21;
+            RD.last_mut().unwrap().rdes1 |= 1<<15;
 
-            RD0.rdes0 = 1<<31;
-            RD0.rdes1 = 2048 | (1<<14);
-            RD0.rdes2 = (&RBUF[0] as *const u32) as u32;
-            RD0.rdes3 = (&RD1   as *const RDes) as u32;
-
-            RD1.rdes0 = 1<<31;
-            RD1.rdes1 = 2048 | (1<<14);
-            RD1.rdes2 = (&RBUF[1] as *const u32) as u32;
-            RD1.rdes3 = (&RD0   as *const RDes) as u32;
-
-            RDPTR = &RD0;
+            // Tell the ETH DMA the start of each ring
+            eth_dma.dmatdlar.write(|w| w.bits(TD.as_ptr() as u32));
+            eth_dma.dmardlar.write(|w| w.bits(RD.as_ptr() as u32));
         }
-
-        eth_dma.dmatdlar.write(|w| unsafe { w.bits((&TD0 as *const TDes) as u32 )});
-        eth_dma.dmardlar.write(|w| unsafe { w.bits((&RD0 as *const RDes) as u32 )});
-
-        // Set DMA interrupts
-        eth_dma.dmaier.write(|w|
-            w.nise().set_bit()
-             .rie().set_bit()
-             .tie().set_bit());
 
         // Set DMA bus mode
         eth_dma.dmabmr.write(|w| unsafe {
@@ -449,12 +428,13 @@ fn mac_init() {
         eth_dma.dmaomr.write(|w| w.ftf().set_bit());
         while eth_dma.dmaomr.read().ftf().is_bit_set() {}
 
-        // Set operation mode and start DMA
+        // Set operation mode to store-and-forward and start DMA
         eth_dma.dmaomr.write(|w|
             w.rsf().set_bit()
              .tsf().set_bit()
              .st().set_bit()
-             .sr().set_bit());
+             .sr().set_bit()
+        );
     });
 }
 
@@ -563,13 +543,13 @@ fn main() {
     let mut ethiface = EthernetInterface::new(
         &mut ethdev, &mut arpcache as &mut ArpCache, ethaddr, &mut ipaddrs[..]);
 
-    let mut tcp_rx_buf_storage = [Default::default(); 128];
-    let mut tcp_tx_buf_storage = [Default::default(); 128];
+    let mut tcp_rx_buf_storage = [0u8; 128];
+    let mut tcp_tx_buf_storage = [0u8; 128];
     let tcp_rx_buf = TcpSocketBuffer::new(&mut tcp_rx_buf_storage[..]);
     let tcp_tx_buf = TcpSocketBuffer::new(&mut tcp_tx_buf_storage[..]);
     let tcp_socket = TcpSocket::new(tcp_rx_buf, tcp_tx_buf);
 
-    let mut sockets_storage = [Default::default(), Default::default()];
+    let mut sockets_storage = [None, None, None, None];
     let mut sockets = SocketSet::new(&mut sockets_storage[..]);
     let tcp_handle = sockets.add(tcp_socket);
 
