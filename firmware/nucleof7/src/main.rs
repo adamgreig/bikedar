@@ -10,13 +10,15 @@ extern crate smoltcp;
 
 use core::u16;
 use cortex_m::asm;
-use stm32f7::stm32f7x7::{GPIOA, GPIOB, GPIOC, GPIOD, GPIOG, USART3, TIM5};
+use stm32f7::stm32f7x7::{GPIOA, GPIOB, GPIOC, GPIOD, GPIOG, USART3, TIM5, DMA1};
 use stm32f7::stm32f7x7::{RCC, PWR, SYSCFG, FLASH, ETHERNET_MAC, ETHERNET_DMA};
 use smoltcp::phy::Device;
 use smoltcp::iface::{ArpCache, SliceArpCache, EthernetInterface};
 use smoltcp::socket::{AsSocket, SocketSet};
 use smoltcp::socket::{TcpSocket, TcpSocketBuffer};
 use smoltcp::wire::{EthernetAddress, IpAddress};
+
+static mut BENCH_BUF: [u32; 8] = [0x00FF_FFFF; 8];
 
 #[repr(C,packed)]
 #[derive(Copy,Clone)]
@@ -37,7 +39,7 @@ struct RDes {
 }
 
 // Assign buffers as u32 to ensure alignment, but we'll use them as u8
-const ETH_BUF_LEN: usize = 8;
+const ETH_BUF_LEN: usize = 2;
 static mut TBUF: [[u32; 2048/4]; ETH_BUF_LEN] = [[0; 2048/4]; ETH_BUF_LEN];
 static mut RBUF: [[u32; 2048/4]; ETH_BUF_LEN] = [[0; 2048/4]; ETH_BUF_LEN];
 static mut TD: [TDes; ETH_BUF_LEN] = [TDes {tdes0: 0, tdes1: 0, tdes2: 0, tdes3: 0}; ETH_BUF_LEN];
@@ -281,6 +283,8 @@ fn rcc_reset() {
              .gpiodrst().reset()
              .gpiogrst().reset()
              .ethmacrst().reset()
+             .dma1rst().reset()
+             .dma2rst().reset()
         );
         rcc.apb1rstr.write(|w|
             w.uart3rst().reset()
@@ -332,7 +336,7 @@ fn usart_init() {
     });
 }
 
-fn usart_send(data: u32) {
+fn usart_send_char(data: u32) {
     cortex_m::interrupt::free(|cs| {
         let usart3 = USART3.borrow(cs);
         while usart3.isr.read().txe().is_bit_clear() {}
@@ -342,8 +346,47 @@ fn usart_send(data: u32) {
 
 fn usart_send_string(data: &str) {
     for c in data.as_bytes() {
-        usart_send(*c as u32);
+        usart_send_char(*c as u32);
     }
+    usart_wait();
+}
+
+fn usart_send_by_dma(data: &[u8]) {
+    cortex_m::interrupt::free(|cs| {
+        let usart3 = USART3.borrow(cs);
+        let dma1 = DMA1.borrow(cs);
+        dma1.s3cr.write(|w| w.en().disabled());
+        dma1.lifcr.write(|w|
+            w.ctcif3().clear()
+             .chtif3().clear()
+             .cteif3().clear()
+             .cdmeif3().clear()
+             .cfeif3().clear()
+        );
+        dma1.s3cr.write(|w| unsafe {
+            w.chsel().bits(4)
+             .msize().byte()
+             .psize().byte()
+             .pinc().fixed()
+             .minc().incremented()
+             .dir().memory_to_peripheral()
+             .pfctrl().dma()
+        });
+        dma1.s3ndtr.write(|w| unsafe { w.ndt().bits(data.len() as u16) });
+        dma1.s3par.write(|w| unsafe { w.bits(&usart3.tdr as *const _ as u32) });
+        dma1.s3m0ar.write(|w| unsafe { w.bits(data.as_ptr() as u32) });
+        usart3.icr.write(|w| w.tccf().set_bit());
+        dma1.s3cr.modify(|_, w| w.en().enabled());
+    });
+    usart_wait();
+}
+
+fn usart_wait() {
+    cortex_m::interrupt::free(|cs| {
+        let usart3 = USART3.borrow(cs);
+        while usart3.isr.read().tc().is_bit_clear() {}
+        usart3.icr.write(|w| w.tccf().set_bit());
+    });
 }
 
 fn timer_init() {
@@ -358,13 +401,12 @@ fn timer_init() {
     });
 }
 
+#[inline]
 fn timer_time() -> u32 {
-    let mut time: u32 = 0;
     cortex_m::interrupt::free(|cs| {
         let tim5 = TIM5.borrow(cs);
-        time = tim5.cnt.read().bits();
-    });
-    time
+        tim5.cnt.read().bits()
+    })
 }
 
 fn mac_init() {
@@ -385,6 +427,7 @@ fn mac_init() {
         eth_mac.maca0hr.write(|w| unsafe { w.bits(0x1d_87) });
 
         // Enable RX and TX now. Set link speed and duplex at link-up event.
+        // We also enable stripping the Ethernet CRCs as we won't use them.
         eth_mac.maccr.write(|w|
             w.re().set_bit()
              .te().set_bit()
@@ -393,14 +436,14 @@ fn mac_init() {
 
         // Unsafe access to static TD/RD and TBUF/RBUF
         unsafe {
-            // Set up all TDes in ring mode with associated buffer
+            // Set up each TDes in ring mode with associated buffer
             for (td, tdbuf) in TD.iter_mut().zip(TBUF.iter()) {
                 td.tdes0 = (1<<29) | (1<<28);
                 td.tdes2 = tdbuf as *const _ as u32;
                 td.tdes3 = 0;
             }
 
-            // Set up all RDes in ring mode with associated buffer
+            // Set up each RDes in ring mode with associated buffer
             for (rd, rdbuf) in RD.iter_mut().zip(RBUF.iter()) {
                 rd.rdes0 = 1<<31;
                 rd.rdes1 = rdbuf.len() as u32 * 4;
@@ -513,12 +556,143 @@ fn phy_poll_link() -> bool {
 }
 
 #[inline(never)]
+fn cache_test() {
+    cortex_m::interrupt::free(|cs| {
+        let scb = cortex_m::peripheral::SCB.borrow(cs);
+        let cpuid = cortex_m::peripheral::CPUID.borrow(cs);
+        scb.disable_dcache(&cpuid);
+
+        let mut x = ['A' as u8, '\r' as u8, '\n' as u8];
+
+        usart_send_string("Operation               Cache  RAM\r\n");
+        usart_send_string("----------------------------------\r\n");
+
+        fn step(op: &str, x: &[u8]) {
+            usart_send_string(op);
+            for _ in 0..27-op.len() {
+                usart_send_char('.' as u32);
+            }
+            usart_wait();
+            usart_send_char(x[0] as u32);
+            usart_wait();
+            for _ in 0..4 {
+                usart_send_char(' ' as u32);
+            }
+            usart_wait();
+            usart_send_by_dma(x);
+            asm::dsb();
+            asm::isb();
+        }
+
+        step("Initial", &x);
+
+        x[0] += 1;
+        step("Increment", &x);
+
+        scb.enable_dcache(&cpuid);
+        step("Enable DCache", &x);
+
+        x[0] += 1;
+        step("Increment", &x);
+
+        scb.clean_dcache(&cpuid);
+        step("Clean DCache", &x);
+
+        x[0] += 1;
+        step("Increment", &x);
+
+        scb.invalidate_dcache(&cpuid);
+        step("Invalidate DCache", &x);
+
+        x[0] += 1;
+        step("Increment", &x);
+
+        scb.clean_invalidate_dcache(&cpuid);
+        step("CleanInvalidate DCache", &x);
+
+        x[0] += 1;
+        step("Increment", &x);
+
+        scb.clean_dcache_by_address(0, 32);
+        step("Clean DCache wrong addr", &x);
+
+        scb.clean_dcache_by_address(x.as_ptr() as u32, 32);
+        step("Clean DCache right addr", &x);
+
+        x[0] += 1;
+        step("Increment", &x);
+
+        scb.invalidate_dcache_by_address(0, 32);
+        step("Inval DCache wrong addr", &x);
+
+        scb.invalidate_dcache_by_address(x.as_ptr() as u32, 32);
+        step("Inval DCache right addr", &x);
+
+        x[0] += 1;
+        step("Increment", &x);
+
+        scb.clean_invalidate_dcache_by_address(0, 32);
+        step("CI DCache wrong addr", &x);
+
+        scb.clean_invalidate_dcache_by_address(x.as_ptr() as u32, 32);
+        step("CI DCache right addr", &x);
+
+        x[0] += 1;
+        step("Increment", &x);
+
+        scb.disable_dcache(&cpuid);
+        step("Disable DCache", &x);
+        asm::bkpt();
+    });
+}
+
+#[inline(never)]
+fn bench_memory() {
+    let cntptr = cortex_m::interrupt::free(|cs| {
+        let tim5 = TIM5.borrow(cs);
+        &tim5.cnt as *const _ as u32
+    });
+    let start: u32;
+    let end: u32;
+    unsafe { BENCH_BUF[0] = 0x00FF_FFFF; }
+    unsafe { asm!("
+        ldr r2, [r4]
+        1:
+        ldr r1, [r0, #28]
+        ldr r1, [r0, #24]
+        ldr r1, [r0, #20]
+        ldr r1, [r0, #16]
+        ldr r1, [r0, #12]
+        ldr r1, [r0, #8]
+        ldr r1, [r0, #4]
+        ldr r1, [r0, #0]
+        subs r1, #1
+        str r1, [r0, #0]
+        str r1, [r0, #4]
+        str r1, [r0, #8]
+        str r1, [r0, #12]
+        str r1, [r0, #16]
+        str r1, [r0, #20]
+        str r1, [r0, #24]
+        str r1, [r0, #28]
+        bne 1b
+        ldr r3, [r4]
+    "
+    : "={r2}"(start), "={r3}"(end)
+    : "{r0}"(BENCH_BUF.as_mut_ptr() as u32), "{r4}"(cntptr)
+    : "r1", "cc", "memory"
+    : "volatile"
+    ); }
+    let duration = end.wrapping_sub(start);
+    hprintln!("Memory benchmark took {}ms", duration);
+}
+
+#[inline(never)]
 fn main() {
     cortex_m::interrupt::free(|cs| {
         let scb = cortex_m::peripheral::SCB.borrow(cs);
         let cpuid = cortex_m::peripheral::CPUID.borrow(cs);
-        //scb.enable_dcache(&cpuid);
-        //scb.enable_icache();
+        scb.disable_icache();
         scb.disable_dcache(&cpuid);
     });
 
@@ -527,8 +701,59 @@ fn main() {
     rcc_reset();
     gpio_init();
     timer_init();
-
     usart_init();
+
+    hprintln!("\r\nRunning memory benchmark with DCache OFF, ICache ON\r\n");
+    cortex_m::interrupt::free(|cs| {
+        let scb = cortex_m::peripheral::SCB.borrow(cs);
+        let cpuid = cortex_m::peripheral::CPUID.borrow(cs);
+        scb.disable_dcache(&cpuid);
+        scb.enable_icache();
+    });
+    bench_memory();
+    bench_memory();
+    bench_memory();
+    bench_memory();
+
+    hprintln!("\r\nRunning memory benchmark with DCache ON, ICache ON\r\n");
+    cortex_m::interrupt::free(|cs| {
+        let scb = cortex_m::peripheral::SCB.borrow(cs);
+        let cpuid = cortex_m::peripheral::CPUID.borrow(cs);
+        scb.enable_dcache(&cpuid);
+        scb.enable_icache();
+    });
+    bench_memory();
+    bench_memory();
+    bench_memory();
+    bench_memory();
+
+    hprintln!("\r\nRunning memory benchmark with DCache ON, ICache OFF\r\n");
+    cortex_m::interrupt::free(|cs| {
+        let scb = cortex_m::peripheral::SCB.borrow(cs);
+        let cpuid = cortex_m::peripheral::CPUID.borrow(cs);
+        scb.enable_dcache(&cpuid);
+        scb.disable_icache();
+    });
+    bench_memory();
+    bench_memory();
+    bench_memory();
+    bench_memory();
+
+    hprintln!("\r\nRunning memory benchmark with DCache OFF, ICache OFF\r\n");
+    cortex_m::interrupt::free(|cs| {
+        let scb = cortex_m::peripheral::SCB.borrow(cs);
+        let cpuid = cortex_m::peripheral::CPUID.borrow(cs);
+        scb.disable_dcache(&cpuid);
+        scb.disable_icache();
+    });
+    bench_memory();
+    bench_memory();
+    bench_memory();
+    bench_memory();
+
+    usart_send_string("\r\n\r\nRunning cache test...\r\n");
+    cache_test();
+
     usart_send_string("\r\n\r\nInitialising network...\r\n");
 
     phy_reset();
